@@ -1,0 +1,51 @@
+# Phone-friendly setup: put this file at .github/workflows/build-from-zip.yml in a new GitHub repo
+# and upload astra-project.zip to the repo root. Every push builds the APK and publishes it under Releases.
+name: Build ASTRA (from zip)
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack the project zip
+        run: |
+          Z=$(ls *.zip 2>/dev/null | head -1)
+          if [ -z "$Z" ]; then echo "Upload astra-project.zip to the repository root first"; exit 1; fi
+          mkdir -p src && unzip -o -q "$Z" -d src
+          if [ -d src/astra ]; then echo "PROJECT=src/astra" >> "$GITHUB_ENV"; else echo "PROJECT=src" >> "$GITHUB_ENV"; fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Core engine tests
+        working-directory: ${{ env.PROJECT }}
+        run: chmod +x gradlew && ./gradlew :core:test --stacktrace
+
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT }}
+        run: ./gradlew :app:testDebugUnitTest :app:assembleDebug --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: astra-debug-apk
+          path: ${{ env.PROJECT }}/app/build/outputs/apk/debug/*.apk
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: ASTRA build ${{ github.run_number }}
+          body: Debug build of ASTRA. Install on Android 12+ (allow "install unknown apps").
+          files: ${{ env.PROJECT }}/app/build/outputs/apk/debug/*.apk
