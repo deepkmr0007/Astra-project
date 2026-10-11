@@ -1,5 +1,7 @@
-# Phone-friendly setup: put this file at .github/workflows/build-from-zip.yml in a new GitHub repo
+# Phone-friendly setup: put this file at .github/workflows/build-from-zip.yml in your GitHub repo
 # and upload astra-project.zip to the repo root. Every push builds the APK and publishes it under Releases.
+# v0.3: newer action versions (no Node 20 warnings), fixed Ubuntu image, Android 37 SDK installed,
+# and on failure a short list of the exact errors appears on the run's Summary page.
 name: Build ASTRA (from zip)
 
 on:
@@ -11,24 +13,52 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # full history, so we can tell which zip was uploaded most recently
 
       - name: Unpack the project zip
         run: |
-          Z=$(ls *.zip 2>/dev/null | head -1)
-          if [ -z "$Z" ]; then echo "Upload astra-project.zip to the repository root first"; exit 1; fi
+          shopt -s nullglob
+          ZIPS=( *.zip )
+          if [ ${#ZIPS[@]} -eq 0 ]; then echo "::error::Upload astra-project.zip to the repository root first"; exit 1; fi
+          # Pick the zip that was committed most recently (not just the first name alphabetically).
+          Z=""; ZT=0
+          for f in "${ZIPS[@]}"; do
+            t=$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0); t=${t:-0}
+            if [ "$t" -ge "$ZT" ]; then ZT=$t; Z="$f"; fi
+          done
+          if [ ${#ZIPS[@]} -gt 1 ]; then
+            echo "::warning::Found ${#ZIPS[@]} zip files (${ZIPS[*]}). Building the newest: $Z. Delete the old ones to avoid confusion."
+          fi
           mkdir -p src && unzip -o -q "$Z" -d src
-          if [ -d src/astra ]; then echo "PROJECT=src/astra" >> "$GITHUB_ENV"; else echo "PROJECT=src" >> "$GITHUB_ENV"; fi
+          if [ -d src/astra ]; then P=src/astra; else P=src; fi
+          echo "PROJECT=$P" >> "$GITHUB_ENV"
+          VER=$(grep -oE 'versionName = "[^"]+"' "$P/app/build.gradle.kts" | cut -d'"' -f2)
+          SDK=$(grep -oE 'compileSdk = [0-9]+' "$P/app/build.gradle.kts" | grep -oE '[0-9]+')
+          echo "Building ASTRA $VER (compileSdk $SDK) from $Z"
+          {
+            echo "## Building ASTRA $VER"
+            echo "- Zip: \`$Z\` (uploaded $(date -u -d @"$ZT" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo unknown))"
+            echo "- compileSdk: $SDK"
+            echo "- Commit: \`${GITHUB_SHA::7}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
 
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v5
+
+      - name: Install Android SDK platform 37
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" --install "platforms;android-37" || echo "Will let Gradle download it instead"
 
       - name: Core engine tests
         working-directory: ${{ env.PROJECT }}
@@ -36,9 +66,33 @@ jobs:
 
       - name: Build debug APK
         working-directory: ${{ env.PROJECT }}
-        run: ./gradlew :app:testDebugUnitTest :app:assembleDebug --stacktrace
+        run: |
+          set -o pipefail
+          ./gradlew :app:testDebugUnitTest :app:assembleDebug --continue 2>&1 | tee build.log
 
-      - uses: actions/upload-artifact@v4
+      - name: Error summary (only when the build fails)
+        if: failure()
+        working-directory: ${{ env.PROJECT }}
+        run: |
+          {
+            echo "## ASTRA build errors"
+            echo
+            echo '```'
+            grep -E "^e: |What went wrong|> .*(error|failed|Failed)|requires|Could not resolve|Unresolved" build.log | head -80 || true
+            echo '```'
+            echo
+            echo "Screenshot this box (or download build.log from Artifacts) and send it back."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the full build log
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: build-log
+          path: ${{ env.PROJECT }}/build.log
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v5
         with:
           name: astra-debug-apk
           path: ${{ env.PROJECT }}/app/build/outputs/apk/debug/*.apk
