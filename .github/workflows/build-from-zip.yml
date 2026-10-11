@@ -35,6 +35,26 @@ jobs:
             echo "::warning::Found ${#ZIPS[@]} zip files (${ZIPS[*]}). Building the newest: $Z. Delete the old ones to avoid confusion."
           fi
           mkdir -p src && unzip -o -q "$Z" -d src
+          cat > .astra-report.sh <<'REPORT'
+          # Turns a failed Gradle log into GitHub annotations (shown at the top of the run, under "Annotations")
+          # and a box on the Summary page, so the exact errors are easy to copy.
+          LOG="$1"; TITLE="$2"
+          if [ ! -f "$LOG" ]; then echo "::error title=$TITLE::No log file was produced — see the step's output above."; exit 0; fi
+          # 1) Code errors (Kotlin, KSP/Room, resources, manifest): the exact file:line lines.
+          ERR=$(grep -E "^e: |^ERROR:|^error: |: error: |\[ksp\].*(error|Error)|AAPT: error|Manifest merger failed" "$LOG" \
+                | sed -E 's#file:///home/runner/work/[^/]+/[^/]+/src/##; s#/home/runner/work/[^/]+/[^/]+/src/##' | awk '!seen[$0]++' | head -60)
+          # 2) Otherwise Gradle's own explanation (dependencies, SDK, configuration problems).
+          if [ -z "$ERR" ]; then
+            ERR=$(sed -n '/What went wrong/,/\* Try/p' "$LOG" | grep -vE "^\* Try|^ *$" | awk '!seen[$0]++' | head -40)
+          fi
+          [ -z "$ERR" ] && ERR=$(tail -40 "$LOG")
+          N=$(printf '%s\n' "$ERR" | grep -c .)
+          ENC=$(printf '%s' "$ERR" | sed -e 's/%/%25/g' -e 's/\r//g' | awk 'BEGIN{ORS="%0A"} {print}')
+          echo "::error title=$TITLE — $N error line(s), copy this::$ENC"
+          printf '%s\n' "$ERR" | head -8 | while IFS= read -r l; do echo "::error title=$TITLE::$l"; done
+          { echo "## $TITLE"; echo; echo '```'; printf '%s\n' "$ERR"; echo '```'; echo; echo "Copy or screenshot this box and send it back."; } >> "$GITHUB_STEP_SUMMARY"
+          REPORT
+          sed -i 's/^          //' .astra-report.sh
           if [ -d src/astra ]; then P=src/astra; else P=src; fi
           echo "PROJECT=$P" >> "$GITHUB_ENV"
           VER=$(grep -oE 'versionName = "[^"]+"' "$P/app/build.gradle.kts" | cut -d'"' -f2)
@@ -62,34 +82,31 @@ jobs:
 
       - name: Core engine tests
         working-directory: ${{ env.PROJECT }}
-        run: chmod +x gradlew && ./gradlew :core:test --stacktrace
+        run: |
+          chmod +x gradlew
+          set +e
+          ./gradlew :core:test --stacktrace 2>&1 | tee core.log
+          status=${PIPESTATUS[0]}
+          if [ $status -ne 0 ]; then bash ../.astra-report.sh core.log "Core tests failed" || true; fi
+          exit $status
 
       - name: Build debug APK
         working-directory: ${{ env.PROJECT }}
         run: |
-          set -o pipefail
+          set +e
           ./gradlew :app:testDebugUnitTest :app:assembleDebug --continue 2>&1 | tee build.log
-
-      - name: Error summary (only when the build fails)
-        if: failure()
-        working-directory: ${{ env.PROJECT }}
-        run: |
-          {
-            echo "## ASTRA build errors"
-            echo
-            echo '```'
-            grep -E "^e: |What went wrong|> .*(error|failed|Failed)|requires|Could not resolve|Unresolved" build.log | head -80 || true
-            echo '```'
-            echo
-            echo "Screenshot this box (or download build.log from Artifacts) and send it back."
-          } >> "$GITHUB_STEP_SUMMARY"
+          status=${PIPESTATUS[0]}
+          if [ $status -ne 0 ]; then bash ../.astra-report.sh build.log "APK build failed" || true; fi
+          exit $status
 
       - name: Keep the full build log
         if: always()
         uses: actions/upload-artifact@v5
         with:
           name: build-log
-          path: ${{ env.PROJECT }}/build.log
+          path: |
+            ${{ env.PROJECT }}/build.log
+            ${{ env.PROJECT }}/core.log
           if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v5
